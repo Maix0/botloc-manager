@@ -6,12 +6,14 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     cargo-workspace.url = "github:Maix0/cargo-ws-flake";
     cargo-semver-checks.url = "github:Maix0/cargo-semver-checks-flake";
+    naersk.url = "github:nix-community/naersk";
   };
   outputs = {
     self,
     nixpkgs,
     flake-utils,
     rust-overlay,
+    naersk,
     ...
   } @ inputs:
     flake-utils.lib.eachDefaultSystem (system: let
@@ -64,36 +66,38 @@
             else pkgs.rust-bin.nightly.${toolchainDef.version}.${toolchainDef.profile}.override (builtins.removeAttrs toolchainDef ["toolchain" "version" "profile"])
           else throw "toolchain version isn't valid (not 'stable' or 'beta' or 'nightly')"
         else throw "toolchainDef isn't a string or an attr describing the toolchain";
+      rust_dev = buildRustToolchain "stable/latest/default";
+      naersk' = pkgs.callPackage naersk {
+        cargo = rust_dev;
+        rustc = rust_dev;
+      };
     in {
-      devShell = let
-        rust_dev = buildRustToolchain "stable/latest/default";
-        # {
-        #   extensions = [];
-        #   targets = ["x86_64-unknown-linux-gnu"];
-        # };
-      in
-        pkgs.mkShell {
-          packages = with pkgs;
-            [
-              rust_dev
-              mold
-              openssl
-              pkg-config
-            ]
-            ++ (packageIf "cargo-semver-checks" (p: p.packages.${system}.default))
-            ++ (packageIf "cargo-workspace" (p: p.packages.${system}.default));
+      packages.default = naersk'.buildPackage {
+        src = ./.;
+      };
 
-          shellHook = ''
-            export RUST_STD="${rust_dev}/share/doc/rust/html/std/index.html"
+      devShell = pkgs.mkShell {
+        packages = with pkgs;
+          [
+            rust_dev
+            mold
+            openssl
+            pkg-config
+          ]
+          ++ (packageIf "cargo-semver-checks" (p: p.packages.${system}.default))
+          ++ (packageIf "cargo-workspace" (p: p.packages.${system}.default));
 
-            if [ -z $CARGO_TARGET_DIR ] then
-              : "''${XDG_CACHE_HOME:="''$HOME/.cache"}"
-              local hash path
-              hash="$(sha1sum - <<< "$PWD" | head -c40)"
-              path="''${PWD//[^a-zA-Z0-9]/}"
-              export CARGO_TARGET_DIR="''${XDG_CACHE_HOME}/rust-targets/$hash-$path"
-            fi
-          '';
-        };
+        shellHook = ''
+          export RUST_STD="${rust_dev}/share/doc/rust/html/std/index.html"
+
+          if [ -z $CARGO_TARGET_DIR ] then
+            : "''${XDG_CACHE_HOME:="''$HOME/.cache"}"
+            local hash path
+            hash="$(sha1sum - <<< "$PWD" | head -c40)"
+            path="''${PWD//[^a-zA-Z0-9]/}"
+            export CARGO_TARGET_DIR="''${XDG_CACHE_HOME}/rust-targets/$hash-$path"
+          fi
+        '';
+      };
     });
 }
