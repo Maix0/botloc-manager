@@ -33,12 +33,13 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
 
 // basic handler that responds with a static string
 async fn root() -> Html<&'static str> {
+    info!("Request link page");
     Html(
         r#"
         <a href="/restart">restart</a><br>
