@@ -7,28 +7,30 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use axum::{
-    extract::{FromRef, Query, State},
-    http::StatusCode,
-    response::{Html, Redirect},
+    async_trait,
+    extract::{FromRef, FromRequestParts, Query, State},
+    http::{request::Parts, StatusCode},
+    response::{AppendHeaders, Html, IntoResponse, Redirect},
     routing::get,
     Json, Router,
 };
 use axum_extra::extract::{
     cookie::{Cookie, Expiration, Key, SameSite},
-    CookieJar, PrivateCookieJar,
+    CookieJar,
 };
 use base64::Engine;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tracing::{error, info};
 
 use oauth2::{
     basic::*, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet,
-    EndpointSet, IntrospectionUrl, RedirectUrl, TokenResponse, TokenUrl,
+    EndpointSet, IntrospectionUrl, RedirectUrl, RefreshToken, TokenResponse, TokenUrl,
 };
 
 macro_rules! unwrap_env {
@@ -39,136 +41,278 @@ macro_rules! unwrap_env {
 
 type OClient = BasicClient<EndpointSet, EndpointNotSet, EndpointSet, EndpointNotSet, EndpointSet>;
 
+#[derive(Clone, Debug)]
+struct Token {
+    token: String,
+    refresh: String,
+}
+
+impl Token {
+    async fn refresh(tok: &BearerToken, config: &AppState) -> Result<(), ()> {
+        let token = match tok {
+            BearerToken::User(i) => {
+                let users = config.users.write().unwrap();
+                users.get(&i).ok_or(())?.refresh.clone()
+            }
+            BearerToken::Provided(_) => return Err(()),
+            BearerToken::App => {
+                let code = config
+                    .oauth
+                    .exchange_client_credentials()
+                    .request_async(&config.http)
+                    .await
+                    .unwrap();
+                config.token.write().unwrap().token = code.access_token().secret().clone();
+                return Ok(());
+            }
+        };
+        let refresh_token = RefreshToken::new(token);
+
+        match config
+            .oauth
+            .exchange_refresh_token(&refresh_token)
+            .request_async(&config.http)
+            .await
+        {
+            Err(e) => Err(error!("Unable to refresh token ! {e}")),
+            Ok(t) => {
+                info!("Refreshed a token !");
+                match tok {
+                    BearerToken::User(i) => {
+                        let mut users = config.users.write().unwrap();
+                        let u = users.get_mut(&i).ok_or(())?;
+                        u.token = t.access_token().secret().clone();
+                        u.refresh = t.refresh_token().unwrap().secret().clone();
+                    }
+                    _ => return Err(()),
+                };
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     http: reqwest::Client,
     oauth: OClient,
     key: Key,
-    users: Arc<RwLock<HashSet<String>>>,
-    code: Arc<String>,
+    users: Arc<RwLock<HashMap<u64, Token>>>,
+    token: Arc<RwLock<Token>>,
+    tutors: Arc<RwLock<HashSet<u64>>>,
 }
-
 impl FromRef<AppState> for Key {
     fn from_ref(state: &AppState) -> Self {
         state.key.clone()
     }
 }
 
-struct UserLoggedIn;
+enum BearerToken {
+    App,
+    User(u64),
+    Provided(Token),
+}
+
+impl AppState {
+    async fn do_request<R: DeserializeOwned>(
+        &self,
+        url: impl reqwest::IntoUrl + Clone,
+        query: impl Serialize,
+        mut tok: BearerToken,
+    ) -> Result<R, ()> {
+        let res = {
+            let mut users = self.users.write().unwrap();
+            let mut lock = match &tok {
+                BearerToken::App => Some(self.token.write().unwrap()),
+                _ => None,
+            };
+            let token = match &mut lock {
+                Some(s) => Ok(&mut **s),
+                None => {
+                    if let BearerToken::User(id) = &tok {
+                        users.get_mut(&id).ok_or(())
+                    } else if let BearerToken::Provided(t) = &mut tok {
+                        Ok(t)
+                    } else {
+                        Err(())
+                    }
+                }
+            }?;
+
+            self.http
+                .get(url.clone())
+                .bearer_auth(&token.token)
+                .query(&query)
+                .send()
+        };
+        let res = res.await.map_err(|e| error!("Error with request {e}"))?;
+        let json = res
+            .json::<Value>()
+            .await
+            .map_err(|e| error!("Error with request response {e}"))?;
+
+        if !json["error"].is_null() && json["message"].as_str() == Some("The access token expired")
+        {
+            Token::refresh(&tok, self).await?;
+            return Box::pin(Self::do_request(self, url, query, tok)).await;
+        }
+
+        serde_json::from_value(json).map_err(|e| error!("error when parsing json {e}"))
+    }
+}
 
 #[derive(Deserialize, Debug)]
 struct User42 {
-    groups: Vec<serde_json::Value>,
+    id: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct GroupsUsers {
+    id: u64,
+}
+
+async fn tutors(config: AppState) {
+    loop {
+        {
+            let mut lock = config.tutors.write().unwrap();
+            lock.clear();
+            let mut page_nb = 0;
+            loop {
+                info!("tutor request (page {page_nb})");
+                let res = config
+                    .do_request::<Vec<GroupsUsers>>(
+                        "https://api.intra.42.fr/v2/groups/166/users",
+                        json! ({
+                            "page[number]": page_nb,
+                            "page[size]": 100,
+                        }),
+                        BearerToken::App,
+                    )
+                    .await
+                    .unwrap();
+                let do_next = res.len() == 100;
+                lock.extend(res.into_iter().map(|s| s.id));
+                if !do_next {
+                    break;
+                }
+                page_nb += 1;
+            }
+        }
+        tokio::time::sleep(Duration::new(3600 * 24 /*tout les jours*/, 0)).await;
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    // initialize tracing
     tracing_subscriber::fmt::init();
-    let oauth = BasicClient::new(ClientId::new(unwrap_env!("CLIENT_ID")))
-        .set_redirect_uri(RedirectUrl::new(format!("http://localhost:3000/auth/callback")).unwrap())
-        .set_introspection_url(
-            IntrospectionUrl::new("https://api.intra.42.fr/oauth/token/info".to_string()).unwrap(),
-        )
-        .set_client_secret(ClientSecret::new(unwrap_env!("CLIENT_SECRET")))
-        .set_auth_uri(
-            AuthUrl::new("https://api.intra.42.fr/oauth/authorize".to_string())
-                .expect("invalid authUrl"),
-        )
-        .set_token_uri(
-            TokenUrl::new("https://api.intra.42.fr/oauth/token".to_string())
-                .expect("invalid tokenUrl"),
-        );
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // initialize tracing
+            let oauth = BasicClient::new(ClientId::new(unwrap_env!("CLIENT_ID")))
+                .set_redirect_uri(
+                    RedirectUrl::new("http://localhost:3000/auth/callback".to_string()).unwrap(),
+                )
+                .set_introspection_url(
+                    IntrospectionUrl::new("https://api.intra.42.fr/oauth/token/info".to_string())
+                        .unwrap(),
+                )
+                .set_client_secret(ClientSecret::new(unwrap_env!("CLIENT_SECRET")))
+                .set_auth_uri(
+                    AuthUrl::new("https://api.intra.42.fr/oauth/authorize".to_string())
+                        .expect("invalid authUrl"),
+                )
+                .set_token_uri(
+                    TokenUrl::new("https://api.intra.42.fr/oauth/token".to_string())
+                        .expect("invalid tokenUrl"),
+                );
 
-    let http = reqwest::ClientBuilder::new()
-        // Following redirects opens the client up to SSRF vulnerabilities.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Client should build");
+            let http = reqwest::ClientBuilder::new()
+                // Following redirects opens the client up to SSRF vulnerabilities.
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Client should build");
 
-    let cookie_secret = unwrap_env!("COOKIE_SECRET");
-    dbg!(&cookie_secret);
-    let base64_value = base64::engine::general_purpose::URL_SAFE
-        .decode(cookie_secret)
-        .unwrap();
-    let key: Key = Key::from(&base64_value);
+            let cookie_secret = unwrap_env!("COOKIE_SECRET");
+            let base64_value = base64::engine::general_purpose::URL_SAFE
+                .decode(cookie_secret)
+                .unwrap();
+            let key: Key = Key::from(&base64_value);
 
-    let code = oauth
-        .exchange_client_credentials()
-        .request_async(&http)
-        .await
-        .unwrap();
-    // build our application with a route
-    let app = Router::new()
-        // `GET /` goes to `root`
-        .route("/", get(root))
-        .route("/status", get(status))
-        .route("/stop", get(stop))
-        .route("/start", get(start))
-        .route("/restart", get(restart))
-        .route("/config", get(get_config))
-        .route("/auth/callback", get(oauth2_callback))
-        .route("/auth/login", get(oauth2_login))
-        .with_state(AppState {
-            key,
-            http,
-            oauth,
-            users: Default::default(),
-            code: dbg!(code.access_token().secret().clone().into()),
-        });
+            let code = oauth
+                .exchange_client_credentials()
+                .request_async(&http)
+                .await
+                .unwrap();
+            let state = AppState {
+                token: Arc::new(RwLock::new(Token {
+                    token: code.access_token().secret().clone(),
+                    refresh: String::new(),
+                })),
+                tutors: Default::default(),
+                key,
+                http,
+                oauth,
+                users: Default::default(),
+            };
+            tokio::task::spawn_local(tutors(state.clone()));
 
-    // run our app with hyper
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+            // build our application with a route
+            let app = Router::new()
+                // `GET /` goes to `root`
+                .route("/", get(root))
+                .route("/status", get(status))
+                .route("/stop", get(stop))
+                .route("/start", get(start))
+                .route("/restart", get(restart))
+                .route("/config", get(get_config))
+                .route("/auth/callback", get(oauth2_callback))
+                .route("/auth/login", get(oauth2_login))
+                .with_state(state);
+
+            // run our app with hyper
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+                .await
+                .unwrap();
+            tracing::info!("listening on {}", listener.local_addr().unwrap());
+            axum::serve(listener, app).await.unwrap();
+        })
+        .await;
 }
 
-async fn oauth2_login(
-    State(AppState {
-        http, oauth, users, ..
-    }): State<AppState>,
-) -> Redirect {
-    let (url, _) = oauth.authorize_url(|| CsrfToken::new_random()).url() else {
-        dbg!("got an error");
-        return Redirect::to("/error/1");
-    };
-    dbg!(&url);
+async fn oauth2_login(State(state): State<AppState>) -> Redirect {
+    let (url, _) = state.oauth.authorize_url(CsrfToken::new_random).url();
     Redirect::to(url.as_str())
 }
 
-async fn oauth2_callback(
-    State(AppState {
-        http,
-        oauth,
-        users,
-        code: app_code,
-        ..
-    }): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-    jar: PrivateCookieJar,
-) -> (PrivateCookieJar, Redirect) {
-    let Some(code) = params.get("code") else {
-        dbg!(());
-        return (jar, Redirect::to("/"));
-    };
-    let Some(state) = params.get("state") else {
-        dbg!(());
-        return (jar, Redirect::to("/"));
-    };
-    dbg!(&code);
+use time::Duration as TDuration;
+use time::OffsetDateTime;
 
+#[axum::debug_handler]
+async fn oauth2_callback(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    jar: CookieJar,
+) -> impl IntoResponse {
+    let Some(code) = params.get("code") else {
+        return (jar, Redirect::to("/"));
+    };
+    let Some(state_csrf) = params.get("state") else {
+        return (jar, Redirect::to("/"));
+    };
     let mut form_data = HashMap::new();
     form_data.insert("grant_type", "authorization_code".to_string());
     form_data.insert("client_id", unwrap_env!("CLIENT_ID"));
     form_data.insert("client_secret", unwrap_env!("CLIENT_SECRET"));
     form_data.insert("code", code.to_string());
-    form_data.insert("redirect_uri", oauth.redirect_uri().unwrap().to_string());
-    form_data.insert("state", state.to_string());
-    dbg!(&form_data);
-    let token_res = match http
-        .post(oauth.token_uri().as_str())
+    form_data.insert(
+        "redirect_uri",
+        state.oauth.redirect_uri().unwrap().to_string(),
+    );
+    form_data.insert("state", state_csrf.to_string());
+    let token_res = match state
+        .http
+        .post(state.oauth.token_uri().as_str())
         .form(&form_data)
         .send()
         .await
@@ -176,65 +320,121 @@ async fn oauth2_callback(
         Ok(o) => o.json::<Value>().await.unwrap(),
         Err(e) => {
             error!("{e}");
-            return (jar, Redirect::to("/auth/"));
+            return (jar, Redirect::to("/auth/error"));
         }
     };
-    dbg!(&token_res);
-
-    let Ok(rep) = http
-        .get("https://api.intra.42.fr/v2/me")
-        .bearer_auth(token_res["access_token"].as_str().unwrap())
-        .send()
+    let Ok(rep) = state
+        .do_request::<User42>(
+            "https://api.intra.42.fr/v2/me",
+            (),
+            BearerToken::Provided(
+                match token_res["access_token"].as_str().ok_or(()).and_then(|t| {
+                    token_res["refresh_token"]
+                        .as_str()
+                        .ok_or(())
+                        .map(|r| Token {
+                            token: t.to_string(),
+                            refresh: r.to_string(),
+                        })
+                }) {
+                    Ok(v) => v,
+                    Err(_) => return (jar, Redirect::to("/error/")),
+                },
+            ),
+        )
         .await
-        .map_err(|e| println!("{e}"))
     else {
-        return (jar, Redirect::to("/error/2"));
-    };
-    let Ok(json) = rep.json::<Value>().await else {
-        return (jar, Redirect::to("/error/3"));
+        info!("failed to get id");
+        return (jar, Redirect::to("/error/"));
     };
 
-    let id = json["id"].as_u64().unwrap();
-    dbg!(&id);
-    let Ok(rep) = http
-        .get(dbg!(format!(
-            "https://api.intra.42.fr/v2/users/{}/groups",
-            id
-        )))
-        .query(&[
-            ("page[size]", 100), /*("filter[id]", id.as_u64().unwrap())*/
-        ])
-        .bearer_auth(&app_code)
-        .send()
-        .await
-        .map_err(|e| println!("{e}"))
-    else {
-        return (jar, Redirect::to("/error/2"));
-    };
-    let Ok(json) = rep.json::<Value>().await else {
-        return (jar, Redirect::to("/error/3"));
-    };
-    let is_tut = json
-        .as_array()
-        .map(|s| s.iter().any(|s| s["id"] == 166))
-        .unwrap_or_default();
-
-    if !is_tut {
-        return (jar, Redirect::to("https://maix.me/"));
+    if !state.tutors.read().unwrap().contains(&rep.id) {
+        info!("non tutor tried to login");
+        return (jar, Redirect::to("/error/"));
     }
-    let mut cookie = Cookie::new("token", id.to_string());
+
+    let mut cookie = Cookie::new("token", rep.id.to_string());
+    let mut now = OffsetDateTime::now_utc();
+    now += TDuration::weeks(52);
+    cookie.set_expires(Some(now));
     cookie.set_same_site(SameSite::None);
-    cookie.set_expires(None);
-    cookie.set_secure(Some(false));
-    users.write().unwrap().insert(id.to_string());
+    cookie.set_secure(true);
+   // cookie.set_domain("localhost:3000");
+    cookie.set_path("/");
+    //cookie.set_http_only(Some(false));
+    state.users.write().unwrap().insert(
+        rep.id,
+        match token_res["access_token"].as_str().ok_or(()).and_then(|t| {
+            dbg!(&token_res)["refresh_token"]
+                .as_str()
+                .ok_or(())
+                .map(|r| Token {
+                    token: t.to_string(),
+                    refresh: r.to_string(),
+                })
+        }) {
+            Ok(v) => v,
+            Err(_) => return (jar, Redirect::to("/error/")),
+        },
+    );
 
-    let jar = jar.add(cookie);
+    let ujar = jar.add(cookie);
+    info!("logged in");
+    (ujar, Redirect::to("/"))
+}
 
-    (jar, Redirect::to("/"))
+#[derive(Clone, Debug)]
+struct UserLoggedIn {
+    id: u64,
+}
+
+#[async_trait]
+impl FromRequestParts<AppState> for UserLoggedIn {
+    type Rejection = (StatusCode, CookieJar, Redirect);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        info!("banane");
+        let jar = CookieJar::from_request_parts(parts, state).await.unwrap();
+        dbg!(&jar);
+        let Some(id) = jar.get("token") else {
+            info!("no cookie");
+            return Err((
+                StatusCode::TEMPORARY_REDIRECT,
+                jar,
+                Redirect::to("/auth/login"),
+            ));
+        };
+
+        let Ok(user_id) = id.value().parse::<u64>() else {
+            let jar = jar.remove("token");
+            info!("not id");
+            return Err((
+                StatusCode::TEMPORARY_REDIRECT,
+                jar,
+                Redirect::to("/auth/login"),
+            ));
+        };
+
+        if state.tutors.read().unwrap().contains(&user_id) {
+            info!("is tut");
+            Ok(UserLoggedIn { id: user_id })
+        } else {
+            info!("not tut");
+            let jar = jar.remove("token");
+            Err((
+                StatusCode::TEMPORARY_REDIRECT,
+                jar,
+                Redirect::to("/auth/login"),
+            ))
+        }
+    }
 }
 
 // basic handler that responds with a static string
-async fn root() -> Html<&'static str> {
+async fn root(_user: UserLoggedIn) -> Html<&'static str> {
     info!("Request link page");
     Html(
         r#"
@@ -247,7 +447,7 @@ async fn root() -> Html<&'static str> {
     )
 }
 
-async fn restart() -> Redirect {
+async fn restart(_user: UserLoggedIn) -> Redirect {
     info!("Requested to restart the bot");
     tokio::spawn(async {
         tokio::process::Command::new("systemctl")
@@ -258,7 +458,7 @@ async fn restart() -> Redirect {
     Redirect::to("/")
 }
 
-async fn start() -> Redirect {
+async fn start(_user: UserLoggedIn) -> Redirect {
     info!("Requested to start the bot");
     tokio::spawn(async {
         tokio::process::Command::new("systemctl")
@@ -269,7 +469,7 @@ async fn start() -> Redirect {
     Redirect::to("/")
 }
 
-async fn stop() -> Redirect {
+async fn stop(_user: UserLoggedIn) -> Redirect {
     info!("Requested to stop the bot");
     tokio::spawn(async {
         tokio::process::Command::new("systemctl")
@@ -285,7 +485,7 @@ struct BotConfig {
     piscine: Vec<String>,
 }
 
-async fn get_config() -> Result<Json<BotConfig>, (StatusCode, String)> {
+async fn get_config(_user: UserLoggedIn) -> Result<Json<BotConfig>, (StatusCode, String)> {
     info!("Requested config");
     let Ok(mut file) = tokio::fs::File::open(std::env::var("CONFIG_PATH").map_err(|e| {
         error!("Failed to open config file: {e}");
