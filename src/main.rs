@@ -211,7 +211,7 @@ async fn main() {
             // initialize tracing
             let oauth = BasicClient::new(ClientId::new(unwrap_env!("CLIENT_ID")))
                 .set_redirect_uri(
-                    RedirectUrl::new("http://localhost:3000/auth/callback".to_string()).unwrap(),
+                    RedirectUrl::new("http://localhost:9911/auth/callback".to_string()).unwrap(),
                 )
                 .set_introspection_url(
                     IntrospectionUrl::new("https://api.intra.42.fr/oauth/token/info".to_string())
