@@ -266,6 +266,7 @@ async fn main() {
                 .route("/start", get(start))
                 .route("/restart", get(restart))
                 .route("/config", get(get_config))
+                .route("/pull", get(git_pull))
                 .route("/auth/callback", get(oauth2_callback))
                 .route("/auth/login", get(oauth2_login))
                 .with_state(state);
@@ -443,6 +444,7 @@ async fn root(_user: UserLoggedIn) -> Html<&'static str> {
         <a href="/start">start</a><br>
         <a href="/status">status</a><br>
         <a href="/config">config</a><br>
+        <a href="/pull">git pull (ask before!)</a><br>
     "#,
     )
 }
