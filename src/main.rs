@@ -359,7 +359,7 @@ async fn oauth2_callback(
     cookie.set_expires(Some(now));
     cookie.set_same_site(SameSite::None);
     cookie.set_secure(true);
-   // cookie.set_domain("localhost:3000");
+    // cookie.set_domain("localhost:3000");
     cookie.set_path("/");
     //cookie.set_http_only(Some(false));
     state.users.write().unwrap().insert(
@@ -483,17 +483,25 @@ async fn stop(_user: UserLoggedIn) -> Redirect {
 #[derive(Serialize, Deserialize)]
 struct BotConfig {
     piscine: Vec<String>,
+    pc_tut: Vec<String>,
+    id_server: String,
+    id_channel_alerte: String,
+    id_rote: String,
+    mois: String,
+    annee: String,
 }
 
 async fn get_config(_user: UserLoggedIn) -> Result<Json<BotConfig>, (StatusCode, String)> {
     info!("Requested config");
-    let Ok(mut file) = tokio::fs::File::open(std::env::var("CONFIG_PATH").map_err(|e| {
-        error!("Failed to open config file: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "please set env CONFIG_PATH".to_string(),
-        )
-    })?)
+    let Ok(mut file) = tokio::fs::File::open(
+        std::env::var("BOTLOC_DIR").map_err(|e| {
+            error!("Failed to open config file: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "please set env CONFIG_PATH".to_string(),
+            )
+        })? + "/config.json",
+    )
     .await
     .map_err(|e| {
         error!("Failed to open config file: {e}");
@@ -502,8 +510,8 @@ async fn get_config(_user: UserLoggedIn) -> Result<Json<BotConfig>, (StatusCode,
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "failed to open config file: {}",
-                std::env::var("CONFIG_PATH").unwrap()
+                "failed to open config file: {}/config.json",
+                std::env::var("BOTLOC_DIR").unwrap()
             ),
         ));
     };
@@ -521,8 +529,8 @@ async fn get_config(_user: UserLoggedIn) -> Result<Json<BotConfig>, (StatusCode,
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "Failed to read config file at {}",
-                std::env::var("CONFIG_PATH").unwrap()
+                "Failed to read config file at {}/config.json",
+                std::env::var("BOTLOC_DIR").unwrap()
             ),
         ));
     };
@@ -533,8 +541,8 @@ async fn get_config(_user: UserLoggedIn) -> Result<Json<BotConfig>, (StatusCode,
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "Failed to read config file as json at {}",
-                std::env::var("CONFIG_PATH").unwrap()
+                "Failed to read config file as json at {}/config.json",
+                std::env::var("BOTLOC_DIR").unwrap()
             ),
         ));
     };
@@ -557,5 +565,37 @@ async fn status() -> Result<String, StatusCode> {
     String::from_utf8(output.stdout).map_err(|e| {
         error!("Error with systemctl  status output {e}");
         StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+async fn git_pull() -> Result<String, (StatusCode, &'static str)> {
+    info!("Requested to pull");
+    let mut output = tokio::process::Command::new("git")
+        .current_dir(std::env::var("BOTLOC_DIR").map_err(|e| {
+            error!("Error with git pull command {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Please set the BOTLOC_DIR variable",
+            )
+        })?)
+        .args(["pull"])
+        .output()
+        .await
+        // let mut output = child.wait_with_output().await
+        .map_err(|e| {
+            error!("Error with git pull command {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error with the git pull command!",
+            )
+        })?;
+    output.stdout.push(b'\n');
+    output.stdout.append(&mut output.stderr);
+    String::from_utf8(output.stdout).map_err(|e| {
+        error!("Error with git pull output {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Error with the git pull output!",
+        )
     })
 }
