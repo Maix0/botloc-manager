@@ -486,9 +486,9 @@ async fn stop(_user: UserLoggedIn) -> Redirect {
 struct BotConfig {
     piscine: Vec<String>,
     pc_tut: Vec<String>,
-    id_server: String,
-    id_channel_alerte: String,
-    id_rote: String,
+    id_server: u64,
+    id_channel_alerte: u64,
+    id_rote: u64,
     mois: String,
     annee: String,
 }
