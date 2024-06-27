@@ -488,7 +488,7 @@ struct BotConfig {
     pc_tut: Vec<String>,
     id_server: u64,
     id_channel_alerte: u64,
-    id_rote: u64,
+    id_role: u64,
     mois: String,
     annee: String,
 }
@@ -572,7 +572,7 @@ async fn status() -> Result<String, StatusCode> {
 
 async fn git_pull() -> Result<String, (StatusCode, &'static str)> {
     info!("Requested to pull");
-    let mut output = tokio::process::Command::new("git")
+    let mut output = tokio::process::Command::new("/home/maix/.nix-profile/bin/git")
         .current_dir(std::env::var("BOTLOC_DIR").map_err(|e| {
             error!("Error with git pull command {e}");
             (
