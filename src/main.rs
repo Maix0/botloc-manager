@@ -211,7 +211,7 @@ async fn main() {
             // initialize tracing
             let oauth = BasicClient::new(ClientId::new(unwrap_env!("CLIENT_ID")))
                 .set_redirect_uri(
-                    RedirectUrl::new("http://localhost:9911/auth/callback".to_string()).unwrap(),
+                    RedirectUrl::new("https://t.maix.me/auth/callback".to_string()).unwrap(),
                 )
                 .set_introspection_url(
                     IntrospectionUrl::new("https://api.intra.42.fr/oauth/token/info".to_string())
@@ -271,7 +271,7 @@ async fn main() {
                 .with_state(state);
 
             // run our app with hyper
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:9911")
                 .await
                 .unwrap();
             tracing::info!("listening on {}", listener.local_addr().unwrap());
