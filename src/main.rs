@@ -266,6 +266,7 @@ async fn main() {
                 .route("/start", get(start))
                 .route("/restart", get(restart))
                 .route("/config", get(get_config))
+                .route("/db", get(get_db))
                 .route("/pull", get(git_pull))
                 .route("/auth/callback", get(oauth2_callback))
                 .route("/auth/login", get(oauth2_login))
@@ -444,6 +445,7 @@ async fn root(_user: UserLoggedIn) -> Html<&'static str> {
         <a href="/start">start</a><br>
         <a href="/status">status</a><br>
         <a href="/config">config</a><br>
+        <a href="/db">db</a><br>
         <a href="/pull">git pull (ask before!)</a><br>
     "#,
     )
@@ -551,6 +553,64 @@ async fn get_config(_user: UserLoggedIn) -> Result<Json<BotConfig>, (StatusCode,
     Ok(Json(val))
 }
 
+async fn get_db(_user: UserLoggedIn) -> Result<Json<Value>, (StatusCode, String)> {
+    info!("Requested config");
+    let Ok(mut file) = tokio::fs::File::open(
+        std::env::var("BOTLOC_DIR").map_err(|e| {
+            error!("Failed to open config file: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "please set env CONFIG_PATH".to_string(),
+            )
+        })? + "/db.json",
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to open config file: {e}");
+        e
+    }) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "failed to open config file: {}/db.json",
+                std::env::var("BOTLOC_DIR").unwrap()
+            ),
+        ));
+    };
+
+    let mut s = String::new();
+    if file
+        .read_to_string(&mut s)
+        .await
+        .map_err(|e| {
+            error!("Failed to open config file: {e}");
+            e
+        })
+        .is_err()
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to read config file at {}/db.json",
+                std::env::var("BOTLOC_DIR").unwrap()
+            ),
+        ));
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&s).map_err(|e| {
+        error!("Failed to open config file: {e}");
+        e
+    }) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to read config file as json at {}/db.json",
+                std::env::var("BOTLOC_DIR").unwrap()
+            ),
+        ));
+    };
+    Ok(Json(val))
+}
+
 async fn status() -> Result<String, StatusCode> {
     info!("Requested status");
     let mut output = tokio::process::Command::new("systemctl")
@@ -571,6 +631,7 @@ async fn status() -> Result<String, StatusCode> {
 }
 
 async fn git_pull() -> Result<String, (StatusCode, &'static str)> {
+    dbg!(std::env::var("PATH"));
     info!("Requested to pull");
     let mut output = tokio::process::Command::new("/home/maix/.nix-profile/bin/git")
         .current_dir(std::env::var("BOTLOC_DIR").map_err(|e| {
