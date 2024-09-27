@@ -4,8 +4,6 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    cargo-workspace.url = "github:Maix0/cargo-ws-flake";
-    cargo-semver-checks.url = "github:Maix0/cargo-semver-checks-flake";
     naersk.url = "github:nix-community/naersk";
   };
   outputs = {
@@ -49,7 +47,7 @@
             else "default";
         in
           buildRustToolchain {
-            toolchain = toolchainType;
+           toolchain = toolchainType;
             version = toolchainVersion;
             profile = toolchainProfile;
           }
@@ -89,14 +87,6 @@
 
         shellHook = ''
           export RUST_STD="${rust_dev}/share/doc/rust/html/std/index.html"
-
-          if [ -z $CARGO_TARGET_DIR ] then
-            : "''${XDG_CACHE_HOME:="''$HOME/.cache"}"
-            local hash path
-            hash="$(sha1sum - <<< "$PWD" | head -c40)"
-            path="''${PWD//[^a-zA-Z0-9]/}"
-            export CARGO_TARGET_DIR="''${XDG_CACHE_HOME}/rust-targets/$hash-$path"
-          fi
         '';
       };
     });

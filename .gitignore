@@ -2,3 +2,4 @@
 envfile
 .direnv
 .target
+.env

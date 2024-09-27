@@ -20,18 +20,15 @@ use axum::{
 };
 use axum_extra::extract::{
     cookie::{Cookie, Expiration, Key, SameSite},
-    CookieJar,
+    CookieJar, PrivateCookieJar,
 };
 use base64::Engine;
+use color_eyre::eyre::Context;
+use reqwest::tls::Version;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, sync::Mutex};
 use tracing::{error, info};
-
-use oauth2::{
-    basic::*, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet,
-    EndpointSet, IntrospectionUrl, RedirectUrl, RefreshToken, TokenResponse, TokenUrl,
-};
 
 macro_rules! unwrap_env {
     ($name:literal) => {
@@ -39,125 +36,19 @@ macro_rules! unwrap_env {
     };
 }
 
-type OClient = BasicClient<EndpointSet, EndpointNotSet, EndpointSet, EndpointNotSet, EndpointSet>;
-
-#[derive(Clone, Debug)]
-struct Token {
-    token: String,
-    refresh: String,
-}
-
-impl Token {
-    async fn refresh(tok: &BearerToken, config: &AppState) -> Result<(), ()> {
-        let token = match tok {
-            BearerToken::User(i) => {
-                let users = config.users.write().unwrap();
-                users.get(&i).ok_or(())?.refresh.clone()
-            }
-            BearerToken::Provided(_) => return Err(()),
-            BearerToken::App => {
-                let code = config
-                    .oauth
-                    .exchange_client_credentials()
-                    .request_async(&config.http)
-                    .await
-                    .unwrap();
-                config.token.write().unwrap().token = code.access_token().secret().clone();
-                return Ok(());
-            }
-        };
-        let refresh_token = RefreshToken::new(token);
-
-        match config
-            .oauth
-            .exchange_refresh_token(&refresh_token)
-            .request_async(&config.http)
-            .await
-        {
-            Err(e) => Err(error!("Unable to refresh token ! {e}")),
-            Ok(t) => {
-                info!("Refreshed a token !");
-                match tok {
-                    BearerToken::User(i) => {
-                        let mut users = config.users.write().unwrap();
-                        let u = users.get_mut(&i).ok_or(())?;
-                        u.token = t.access_token().secret().clone();
-                        u.refresh = t.refresh_token().unwrap().secret().clone();
-                    }
-                    _ => return Err(()),
-                };
-                Ok(())
-            }
-        }
-    }
-}
+mod oauth2;
 
 #[derive(Clone)]
 struct AppState {
     http: reqwest::Client,
-    oauth: OClient,
+    oauth: Arc<oauth2::OauthClient>,
+    tutors: Arc<Mutex<HashSet<u64>>>,
     key: Key,
-    users: Arc<RwLock<HashMap<u64, Token>>>,
-    token: Arc<RwLock<Token>>,
-    tutors: Arc<RwLock<HashSet<u64>>>,
 }
+
 impl FromRef<AppState> for Key {
-    fn from_ref(state: &AppState) -> Self {
-        state.key.clone()
-    }
-}
-
-enum BearerToken {
-    App,
-    User(u64),
-    Provided(Token),
-}
-
-impl AppState {
-    async fn do_request<R: DeserializeOwned>(
-        &self,
-        url: impl reqwest::IntoUrl + Clone,
-        query: impl Serialize,
-        mut tok: BearerToken,
-    ) -> Result<R, ()> {
-        let res = {
-            let mut users = self.users.write().unwrap();
-            let mut lock = match &tok {
-                BearerToken::App => Some(self.token.write().unwrap()),
-                _ => None,
-            };
-            let token = match &mut lock {
-                Some(s) => Ok(&mut **s),
-                None => {
-                    if let BearerToken::User(id) = &tok {
-                        users.get_mut(&id).ok_or(())
-                    } else if let BearerToken::Provided(t) = &mut tok {
-                        Ok(t)
-                    } else {
-                        Err(())
-                    }
-                }
-            }?;
-
-            self.http
-                .get(url.clone())
-                .bearer_auth(&token.token)
-                .query(&query)
-                .send()
-        };
-        let res = res.await.map_err(|e| error!("Error with request {e}"))?;
-        let json = res
-            .json::<Value>()
-            .await
-            .map_err(|e| error!("Error with request response {e}"))?;
-
-        if !json["error"].is_null() && json["message"].as_str() == Some("The access token expired")
-        {
-            Token::refresh(&tok, self).await?;
-            return Box::pin(Self::do_request(self, url, query, tok)).await;
-        }
-
-        serde_json::from_value(json).map_err(|e| error!("error when parsing json {e}"))
+    fn from_ref(input: &AppState) -> Self {
+        input.key.clone()
     }
 }
 
@@ -174,19 +65,19 @@ struct GroupsUsers {
 async fn tutors(config: AppState) {
     loop {
         {
-            let mut lock = config.tutors.write().unwrap();
+            let mut lock = config.tutors.lock().await;
             lock.clear();
             let mut page_nb = 0;
             loop {
                 info!("tutor request (page {page_nb})");
                 let res = config
-                    .do_request::<Vec<GroupsUsers>>(
+                    .oauth
+                    .do_request::<Vec<User42>>(
                         "https://api.intra.42.fr/v2/groups/166/users",
-                        json! ({
+                        &json! ({
                             "page[number]": page_nb,
                             "page[size]": 100,
                         }),
-                        BearerToken::App,
                     )
                     .await
                     .unwrap();
@@ -209,27 +100,13 @@ async fn main() {
     local
         .run_until(async {
             // initialize tracing
-            let oauth = BasicClient::new(ClientId::new(unwrap_env!("CLIENT_ID")))
-                .set_redirect_uri(
-                    RedirectUrl::new("https://t.maix.me/auth/callback".to_string()).unwrap(),
-                )
-                .set_introspection_url(
-                    IntrospectionUrl::new("https://api.intra.42.fr/oauth/token/info".to_string())
-                        .unwrap(),
-                )
-                .set_client_secret(ClientSecret::new(unwrap_env!("CLIENT_SECRET")))
-                .set_auth_uri(
-                    AuthUrl::new("https://api.intra.42.fr/oauth/authorize".to_string())
-                        .expect("invalid authUrl"),
-                )
-                .set_token_uri(
-                    TokenUrl::new("https://api.intra.42.fr/oauth/token".to_string())
-                        .expect("invalid tokenUrl"),
-                );
-
             let http = reqwest::ClientBuilder::new()
                 // Following redirects opens the client up to SSRF vulnerabilities.
                 .redirect(reqwest::redirect::Policy::none())
+                .user_agent("AlterPoste/1.0")
+                .tls_info(true)
+                .min_tls_version(Version::TLS_1_0)
+                .max_tls_version(Version::TLS_1_2)
                 .build()
                 .expect("Client should build");
 
@@ -238,22 +115,20 @@ async fn main() {
                 .decode(cookie_secret)
                 .unwrap();
             let key: Key = Key::from(&base64_value);
+            let oauth = oauth2::OauthClient::new(
+                http.clone(),
+                unwrap_env!("CLIENT_ID"),
+                unwrap_env!("CLIENT_SECRET"),
+                "http://local.maix.me/auth/callback",
+            )
+            .await
+            .unwrap();
 
-            let code = oauth
-                .exchange_client_credentials()
-                .request_async(&http)
-                .await
-                .unwrap();
             let state = AppState {
-                token: Arc::new(RwLock::new(Token {
-                    token: code.access_token().secret().clone(),
-                    refresh: String::new(),
-                })),
-                tutors: Default::default(),
-                key,
                 http,
-                oauth,
-                users: Default::default(),
+                key,
+                oauth: Arc::new(oauth),
+                tutors: Default::default(),
             };
             tokio::task::spawn_local(tutors(state.clone()));
 
@@ -265,26 +140,39 @@ async fn main() {
                 .route("/stop", get(stop))
                 .route("/start", get(start))
                 .route("/restart", get(restart))
-                .route("/config", get(get_config))
-                .route("/db", get(get_db))
                 .route("/pull", get(git_pull))
                 .route("/auth/callback", get(oauth2_callback))
                 .route("/auth/login", get(oauth2_login))
                 .with_state(state);
 
             // run our app with hyper
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:9911")
-                .await
-                .unwrap();
+            let listener = tokio::net::TcpListener::bind(format!(
+                "127.0.0.1:{}",
+                std::env::args()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(9911)
+            ))
+            .await
+            .unwrap();
             tracing::info!("listening on {}", listener.local_addr().unwrap());
             axum::serve(listener, app).await.unwrap();
         })
         .await;
 }
 
-async fn oauth2_login(State(state): State<AppState>) -> Redirect {
-    let (url, _) = state.oauth.authorize_url(CsrfToken::new_random).url();
-    Redirect::to(url.as_str())
+async fn oauth2_login(State(state): State<AppState>) -> Result<Redirect, StatusCode> {
+    Ok(Redirect::to(
+        &(state
+            .oauth
+            .get_auth_url()
+            .await
+            .map_err(|e| {
+                error!("{e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .to_string()),
+    ))
 }
 
 use time::Duration as TDuration;
@@ -294,95 +182,46 @@ use time::OffsetDateTime;
 async fn oauth2_callback(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
-    jar: CookieJar,
-) -> impl IntoResponse {
-    let Some(code) = params.get("code") else {
-        return (jar, Redirect::to("/"));
+    jar: PrivateCookieJar,
+) -> Result<impl IntoResponse, StatusCode> {
+    let inner = || async {
+        let Some(code) = params.get("code") else {
+            return Ok::<_, color_eyre::eyre::Report>((jar, Redirect::to("/")));
+        };
+        let Some(state_csrf) = params.get("state") else {
+            return Ok((jar, Redirect::to("/")));
+        };
+        let token = state
+            .oauth
+            .get_user_token(code, state_csrf)
+            .await
+            .wrap_err("callback")?;
+
+        let rep = state
+            .http
+            .get("https://api.intra.42.fr/v2/users/me")
+            .bearer_auth(&token.access_token)
+            .send()
+            .await
+            .wrap_err("Unable to get user self")?;
+
+        let json: User42 = rep.json().await.wrap_err("unable to parse api reply")?;
+        let mut cookie = Cookie::new("token", json.id.to_string());
+        cookie.set_same_site(SameSite::None);
+        cookie.set_secure(true);
+        cookie.set_path("/");
+        // cookie.set_domain("localhost:3000");
+        // cookie.set_http_only(Some(false));
+        let ujar = jar.add(cookie);
+        Ok((ujar, Redirect::to("/")))
     };
-    let Some(state_csrf) = params.get("state") else {
-        return (jar, Redirect::to("/"));
-    };
-    let mut form_data = HashMap::new();
-    form_data.insert("grant_type", "authorization_code".to_string());
-    form_data.insert("client_id", unwrap_env!("CLIENT_ID"));
-    form_data.insert("client_secret", unwrap_env!("CLIENT_SECRET"));
-    form_data.insert("code", code.to_string());
-    form_data.insert(
-        "redirect_uri",
-        state.oauth.redirect_uri().unwrap().to_string(),
-    );
-    form_data.insert("state", state_csrf.to_string());
-    let token_res = match state
-        .http
-        .post(state.oauth.token_uri().as_str())
-        .form(&form_data)
-        .send()
-        .await
-    {
-        Ok(o) => o.json::<Value>().await.unwrap(),
+    match inner().await {
+        Ok(ret) => Ok(ret),
         Err(e) => {
-            error!("{e}");
-            return (jar, Redirect::to("/auth/error"));
+            error!("{:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-    };
-    let Ok(rep) = state
-        .do_request::<User42>(
-            "https://api.intra.42.fr/v2/me",
-            (),
-            BearerToken::Provided(
-                match token_res["access_token"].as_str().ok_or(()).and_then(|t| {
-                    token_res["refresh_token"]
-                        .as_str()
-                        .ok_or(())
-                        .map(|r| Token {
-                            token: t.to_string(),
-                            refresh: r.to_string(),
-                        })
-                }) {
-                    Ok(v) => v,
-                    Err(_) => return (jar, Redirect::to("/error/")),
-                },
-            ),
-        )
-        .await
-    else {
-        info!("failed to get id");
-        return (jar, Redirect::to("/error/"));
-    };
-
-    if !state.tutors.read().unwrap().contains(&rep.id) {
-        info!("non tutor tried to login");
-        return (jar, Redirect::to("/error/"));
     }
-
-    let mut cookie = Cookie::new("token", rep.id.to_string());
-    let mut now = OffsetDateTime::now_utc();
-    now += TDuration::weeks(52);
-    cookie.set_expires(Some(now));
-    cookie.set_same_site(SameSite::None);
-    cookie.set_secure(true);
-    // cookie.set_domain("localhost:3000");
-    cookie.set_path("/");
-    //cookie.set_http_only(Some(false));
-    state.users.write().unwrap().insert(
-        rep.id,
-        match token_res["access_token"].as_str().ok_or(()).and_then(|t| {
-            dbg!(&token_res)["refresh_token"]
-                .as_str()
-                .ok_or(())
-                .map(|r| Token {
-                    token: t.to_string(),
-                    refresh: r.to_string(),
-                })
-        }) {
-            Ok(v) => v,
-            Err(_) => return (jar, Redirect::to("/error/")),
-        },
-    );
-
-    let ujar = jar.add(cookie);
-    info!("logged in");
-    (ujar, Redirect::to("/"))
 }
 
 #[derive(Clone, Debug)]
@@ -420,7 +259,7 @@ impl FromRequestParts<AppState> for UserLoggedIn {
             ));
         };
 
-        if state.tutors.read().unwrap().contains(&user_id) {
+        if state.tutors.lock().await.contains(&user_id) {
             info!("is tut");
             Ok(UserLoggedIn { id: user_id })
         } else {
@@ -444,7 +283,6 @@ async fn root(_user: UserLoggedIn) -> Html<&'static str> {
         <a href="/stop">stop</a><br>
         <a href="/start">start</a><br>
         <a href="/status">status</a><br>
-        <a href="/config">config</a><br>
         <a href="/db">db</a><br>
         <a href="/pull">git pull (ask before!)</a><br>
     "#,
@@ -484,137 +322,10 @@ async fn stop(_user: UserLoggedIn) -> Redirect {
     Redirect::to("/")
 }
 
-#[derive(Serialize, Deserialize)]
-struct BotConfig {
-    piscine: Vec<String>,
-    pc_tut: Vec<String>,
-    id_server: u64,
-    id_channel_alerte: u64,
-    id_role: u64,
-    mois: String,
-    annee: String,
-}
-
-async fn get_config(_user: UserLoggedIn) -> Result<Json<BotConfig>, (StatusCode, String)> {
-    info!("Requested config");
-    let Ok(mut file) = tokio::fs::File::open(
-        std::env::var("BOTLOC_DIR").map_err(|e| {
-            error!("Failed to open config file: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "please set env CONFIG_PATH".to_string(),
-            )
-        })? + "/config.json",
-    )
-    .await
-    .map_err(|e| {
-        error!("Failed to open config file: {e}");
-        e
-    }) else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "failed to open config file: {}/config.json",
-                std::env::var("BOTLOC_DIR").unwrap()
-            ),
-        ));
-    };
-
-    let mut s = String::new();
-    if file
-        .read_to_string(&mut s)
-        .await
-        .map_err(|e| {
-            error!("Failed to open config file: {e}");
-            e
-        })
-        .is_err()
-    {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Failed to read config file at {}/config.json",
-                std::env::var("BOTLOC_DIR").unwrap()
-            ),
-        ));
-    };
-    let Ok(val) = serde_json::from_str::<BotConfig>(&s).map_err(|e| {
-        error!("Failed to open config file: {e}");
-        e
-    }) else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Failed to read config file as json at {}/config.json",
-                std::env::var("BOTLOC_DIR").unwrap()
-            ),
-        ));
-    };
-    Ok(Json(val))
-}
-
-async fn get_db(_user: UserLoggedIn) -> Result<Json<Value>, (StatusCode, String)> {
-    info!("Requested config");
-    let Ok(mut file) = tokio::fs::File::open(
-        std::env::var("BOTLOC_DIR").map_err(|e| {
-            error!("Failed to open config file: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "please set env CONFIG_PATH".to_string(),
-            )
-        })? + "/db.json",
-    )
-    .await
-    .map_err(|e| {
-        error!("Failed to open config file: {e}");
-        e
-    }) else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "failed to open config file: {}/db.json",
-                std::env::var("BOTLOC_DIR").unwrap()
-            ),
-        ));
-    };
-
-    let mut s = String::new();
-    if file
-        .read_to_string(&mut s)
-        .await
-        .map_err(|e| {
-            error!("Failed to open config file: {e}");
-            e
-        })
-        .is_err()
-    {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Failed to read config file at {}/db.json",
-                std::env::var("BOTLOC_DIR").unwrap()
-            ),
-        ));
-    };
-    let Ok(val) = serde_json::from_str::<Value>(&s).map_err(|e| {
-        error!("Failed to open config file: {e}");
-        e
-    }) else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Failed to read config file as json at {}/db.json",
-                std::env::var("BOTLOC_DIR").unwrap()
-            ),
-        ));
-    };
-    Ok(Json(val))
-}
-
 async fn status() -> Result<String, StatusCode> {
     info!("Requested status");
-    let mut output = tokio::process::Command::new("systemctl")
-        .args(["--user", "status", "botloc.service"])
+    let mut output = tokio::process::Command::new("journalctl")
+        .args(["-xeu", "botloc"])
         .output()
         .await
         // let mut output = child.wait_with_output().await
@@ -631,7 +342,6 @@ async fn status() -> Result<String, StatusCode> {
 }
 
 async fn git_pull() -> Result<String, (StatusCode, &'static str)> {
-    dbg!(std::env::var("PATH"));
     info!("Requested to pull");
     let mut output = tokio::process::Command::new("/home/maix/.nix-profile/bin/git")
         .current_dir(std::env::var("BOTLOC_DIR").map_err(|e| {
