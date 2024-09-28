@@ -144,6 +144,7 @@ async fn main() {
                 .route("/pull", get(git_pull))
                 .route("/auth/callback", get(oauth2_callback))
                 .route("/auth/login", get(oauth2_login))
+                .route("/auth/error", get(auth_error))
                 .with_state(state);
 
             // run our app with hyper
@@ -203,7 +204,7 @@ async fn oauth2_callback(
 
         let mut cookie = Cookie::new("token", res.id.to_string());
         cookie.set_same_site(SameSite::None);
-        cookie.set_secure(false);
+        cookie.set_secure(true);
         cookie.set_path("/");
         // cookie.set_domain("localhost:3000");
         // cookie.set_http_only(Some(false));
@@ -257,10 +258,19 @@ impl FromRequestParts<AppState> for UserLoggedIn {
             Err((
                 StatusCode::TEMPORARY_REDIRECT,
                 jar,
-                Redirect::to("/auth/login"),
+                Redirect::to("/auth/error"),
             ))
         }
     }
+}
+// basic handler that responds with a static string
+async fn auth_error() -> Html<&'static str> {
+    info!("Request auth_error page");
+    Html(
+        r#"
+        <h1>Hello TUTORS ONLY :D</h1>
+        "#,
+    )
 }
 
 // basic handler that responds with a static string
@@ -313,7 +323,7 @@ async fn stop(_user: UserLoggedIn) -> Redirect {
 async fn status() -> Result<String, StatusCode> {
     info!("Requested status");
     let mut output = tokio::process::Command::new("journalctl")
-        .args(["-xeu", "botloc"])
+        .args(["--user", "-xeu", "botloc"])
         .output()
         .await
         // let mut output = child.wait_with_output().await

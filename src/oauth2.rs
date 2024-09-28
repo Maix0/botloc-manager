@@ -47,13 +47,15 @@ impl OauthClient {
         form_data.insert("grant_type", "client_credentials");
         form_data.insert("client_id", uid);
         form_data.insert("client_secret", secret);
-        let response = client
+        let res = client
             .post("https://api.intra.42.fr/oauth/token")
             .form(&form_data)
             .send()
             .await
             .wrap_err("Sending request to fetch 42 API token")?;
-        let json: Token = response.json().await.wrap_err("API response to json")?;
+        let text = res.text().await.wrap_err("API reponse to text")?;
+        let json: Token = serde_json::from_str(&text)
+            .wrap_err_with(|| format!("API response to json: {text}"))?;
         Ok(json)
     }
     pub async fn new(
@@ -89,7 +91,7 @@ impl OauthClient {
             ))
             .build()
             .wrap_err("Failed to build URI")?;
-        Ok(uri)
+        Ok(dbg!(uri))
     }
 
     pub async fn get_user_token(
@@ -107,14 +109,16 @@ impl OauthClient {
         form_data.insert("client_secret", &self.client_secret);
         form_data.insert("redirect_uri", &self.redirect_uri);
         form_data.insert("grant_type", "authorization_code");
-        let response = self
+        let res = self
             .http
             .post("https://api.intra.42.fr/oauth/token")
             .form(&form_data)
             .send()
             .await
             .wrap_err("Failed to get token for user")?;
-        let json: Token = response.json().await.wrap_err("API response to json")?;
+        let text = res.text().await.wrap_err("API reponse to text")?;
+        let json: Token = serde_json::from_str(&text)
+            .wrap_err_with(|| format!("API response to json: {text}"))?;
         Ok(json)
     }
 
@@ -128,7 +132,7 @@ impl OauthClient {
         let token = token
             .map(IntoToken::get_token)
             .unwrap_or_else(|| self.token.get_token());
-        let req = self
+        let res = self
             .http
             .get(url)
             .query(qs)
@@ -136,10 +140,9 @@ impl OauthClient {
             .send()
             .await
             .wrap_err("Failed to send request")?;
-        let json = req
-            .json()
-            .await
-            .wrap_err("Failed to Deserialize response")?;
+        let text = res.text().await.wrap_err("API reponse to text")?;
+        let json = serde_json::from_str(&text)
+            .wrap_err_with(|| format!("API response to json: {text}"))?;
         Ok(json)
     }
 }
