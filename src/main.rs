@@ -20,7 +20,7 @@ use axum::{
 };
 use axum_extra::extract::{
     cookie::{Cookie, Key, SameSite},
-    CookieJar, PrivateCookieJar,
+    PrivateCookieJar,
 };
 use base64::Engine;
 use color_eyre::eyre::Context;
@@ -28,7 +28,7 @@ use reqwest::tls::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 macro_rules! unwrap_env {
     ($name:literal) => {
@@ -40,7 +40,7 @@ mod oauth2;
 
 #[derive(Clone)]
 struct AppState {
-    http: reqwest::Client,
+    _http: reqwest::Client,
     oauth: Arc<oauth2::OauthClient>,
     tutors: Arc<Mutex<HashSet<u64>>>,
     key: Key,
@@ -126,7 +126,7 @@ async fn main() {
             .unwrap();
 
             let state = AppState {
-                http,
+                _http: http,
                 key,
                 oauth: Arc::new(oauth),
                 tutors: Default::default(),
