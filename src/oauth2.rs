@@ -17,11 +17,21 @@ pub struct OauthClient {
 pub struct Token {
     #[serde(default)]
     refresh_token: Option<String>,
-    pub access_token: String,
+    access_token: String,
     token_type: String,
     expires_in: u64,
     scope: String,
     created_at: u64,
+}
+
+pub trait IntoToken {
+    fn get_token(&self) -> &str;
+}
+
+impl IntoToken for Token {
+    fn get_token(&self) -> &str {
+        &self.access_token
+    }
 }
 
 impl OauthClient {
@@ -43,10 +53,7 @@ impl OauthClient {
             .send()
             .await
             .wrap_err("Sending request to fetch 42 API token")?;
-        let body = response.bytes().await?;
-        let text = String::from_utf8_lossy(&body);
-        println!("{}", text);
-        let json: Token = serde_json::from_slice(&body).unwrap(); // response.json().await.wrap_err("API response to json")?;
+        let json: Token = response.json().await.wrap_err("API response to json")?;
         Ok(json)
     }
     pub async fn new(
@@ -77,7 +84,7 @@ impl OauthClient {
             .scheme("https")
             .authority("api.intra.42.fr")
             .path_and_query(format!(
-                "/oauth/authorize?client_id={}&scope=public&response_type=code&redirect_uri={redirect_uri}&code={}",
+                "/oauth/authorize?client_id={}&scope=public&response_type=code&redirect_uri={redirect_uri}&state={}",
                 self.client_id, base64::engine::general_purpose::URL_SAFE.encode(csrf)
             ))
             .build()
@@ -115,13 +122,17 @@ impl OauthClient {
         &self,
         url: impl AsRef<str>,
         qs: &impl Serialize,
+        token: Option<&impl IntoToken>,
     ) -> eyre::Result<R> {
         let url = url.as_ref();
+        let token = token
+            .map(IntoToken::get_token)
+            .unwrap_or_else(|| self.token.get_token());
         let req = self
             .http
             .get(url)
             .query(qs)
-            .bearer_auth(&self.token.access_token)
+            .bearer_auth(token)
             .send()
             .await
             .wrap_err("Failed to send request")?;
