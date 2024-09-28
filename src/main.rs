@@ -104,7 +104,7 @@ async fn main() {
             let http = reqwest::ClientBuilder::new()
                 // Following redirects opens the client up to SSRF vulnerabilities.
                 .redirect(reqwest::redirect::Policy::none())
-                .user_agent("AlterPoste/1.0")
+                .user_agent("AlertePoste/1.0")
                 .tls_info(true)
                 .min_tls_version(Version::TLS_1_0)
                 .max_tls_version(Version::TLS_1_2)
@@ -120,7 +120,7 @@ async fn main() {
                 http.clone(),
                 unwrap_env!("CLIENT_ID"),
                 unwrap_env!("CLIENT_SECRET"),
-                "http://local.maix.me:9911/auth/callback",
+                "https://t.maix.me/auth/callback",
             )
             .await
             .unwrap();
