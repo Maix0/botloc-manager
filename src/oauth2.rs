@@ -3,13 +3,20 @@ use std::collections::HashMap;
 use base64::Engine;
 use color_eyre::eyre::{self, WrapErr};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tracing::info;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ApiError<'a> {
+    message: &'a str,
+    error: &'a str,
+}
 
 #[derive(Clone, Debug)]
 pub struct OauthClient {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
-    token: Token,
+    token: std::sync::Arc<tokio::sync::Mutex<Token>>,
     http: reqwest::Client,
 }
 
@@ -71,7 +78,7 @@ impl OauthClient {
         Ok(Self {
             client_id: uid.to_string(),
             client_secret: secret.to_string(),
-            token,
+            token: std::sync::Arc::new(tokio::sync::Mutex::new(token)),
             redirect_uri,
             http: client,
         })
@@ -125,24 +132,49 @@ impl OauthClient {
     pub async fn do_request<R: DeserializeOwned>(
         &self,
         url: impl AsRef<str>,
-        qs: &impl Serialize,
-        token: Option<&impl IntoToken>,
+        qs: impl Serialize,
+        token: Option<&Token>,
     ) -> eyre::Result<R> {
-        let url = url.as_ref();
-        let token = token
-            .map(IntoToken::get_token)
-            .unwrap_or_else(|| self.token.get_token());
-        let res = self
-            .http
-            .get(url)
-            .query(qs)
-            .bearer_auth(token)
-            .send()
-            .await
-            .wrap_err("Failed to send request")?;
-        let text = res.text().await.wrap_err("API reponse to text")?;
-        let json = serde_json::from_str(&text)
-            .wrap_err_with(|| format!("API response to json: {text}"))?;
-        Ok(json)
+        loop {
+            let url = url.as_ref();
+            let is_apptoken = token.is_none();
+            let s: String;
+            let token = match token {
+                Some(i) => i.get_token(),
+                None => {
+                    s = self.token.lock().await.get_token().to_string();
+                    s.as_str()
+                }
+            };
+            let res = self
+                .http
+                .get(url)
+                .query(&qs)
+                .bearer_auth(token)
+                .send()
+                .await
+                .wrap_err("Failed to send request")?;
+            let text = res.text().await.wrap_err("API reponse to text")?;
+            if let Ok(err) = serde_json::from_str::<ApiError<'_>>(&text) {
+                if is_apptoken
+                    && err.message == "The access token expired"
+                    && err.error == "Not authorized"
+                {
+                    info!("Refreshing token !");
+
+                    let tok = Self::get_app_token(
+                        self.http.clone(),
+                        &self.client_id,
+                        &self.client_secret,
+                    )
+                    .await?;
+                    *self.token.lock().await = tok;
+                    continue;
+                }
+            }
+            let json = serde_json::from_str(&text)
+                .wrap_err_with(|| format!("API response to json: {text}"))?;
+            break Ok(json);
+        }
     }
 }

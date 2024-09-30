@@ -74,7 +74,7 @@ async fn tutors(config: AppState) {
                     .oauth
                     .do_request::<Vec<User42>>(
                         "https://api.intra.42.fr/v2/groups/166/users",
-                        &json! ({
+                        json! ({
                             "page[number]": page_nb,
                             "page[size]": 100,
                         }),
@@ -120,7 +120,7 @@ async fn main() {
                 http.clone(),
                 unwrap_env!("CLIENT_ID"),
                 unwrap_env!("CLIENT_SECRET"),
-                "https://t.maix.me/auth/callback",
+                "http://local.maix.me:9911/auth/callback",
             )
             .await
             .unwrap();
@@ -198,13 +198,17 @@ async fn oauth2_callback(
 
         let res: User42 = state
             .oauth
-            .do_request("https://api.intra.42.fr/v2/me", &(), Some(&token))
+            .do_request(
+                "https://api.intra.42.fr/v2/me",
+                &[] as &[(String, String); 0],
+                Some(&token),
+            )
             .await
             .wrap_err("Unable to get user self")?;
 
         let mut cookie = Cookie::new("token", res.id.to_string());
         cookie.set_same_site(SameSite::None);
-        cookie.set_secure(true);
+        cookie.set_secure(false);
         cookie.set_path("/");
         // cookie.set_domain("localhost:3000");
         // cookie.set_http_only(Some(false));
